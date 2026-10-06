@@ -464,19 +464,73 @@ def _ffmpeg_err_hint(err):
     return hint[:160]
 
 
-def _probe_ffmpeg_fallback(path):
+def _run_capture(cmd, timeout=60, log=None, tag=''):
+    """运行子进程并捕获输出,永不返回 None。
+
+    要点: stdin=DEVNULL —— 无控制台的 --windowed exe 里 stdin 句柄无效,
+    子进程继承后可能静默失败(stdout/stderr 全空);显式给 DEVNULL 断开继承。
+    若捕获结果两个流全空,再用二进制模式重试一次(排除 text 管道层怪问题)。
+    返回 (rc, out, err) —— 全是 str。"""
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, errors='replace', timeout=timeout,
+                           creationflags=CREATE_NO_WINDOW)
+        rc, out, err = r.returncode, r.stdout or '', r.stderr or ''
+    except subprocess.TimeoutExpired:
+        raise
+    except Exception as e:
+        if log:
+            log(f'[探测]{tag} 启动失败: {type(e).__name__}: {str(e)[:120]}')
+        raise
+    if not out and not err:
+        try:
+            r2 = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=timeout, creationflags=CREATE_NO_WINDOW)
+            out = (r2.stdout or b'').decode('utf-8', 'replace')
+            err = (r2.stderr or b'').decode('utf-8', 'replace')
+            rc = r2.returncode
+            if log:
+                log(f'[探测]{tag} 捕获全空,二进制重试: rc={rc} '
+                    f'out={len(out)}B err={len(err)}B')
+        except Exception as e:
+            if log:
+                log(f'[探测]{tag} 二进制重试失败: {type(e).__name__}: {str(e)[:120]}')
+    return rc, out, err
+
+
+def _log_head(log, tag, err, n=3):
+    """调试日志: 打印 stderr 前几行(截断)。"""
+    if not log:
+        return
+    lines = [l.strip() for l in err.splitlines() if l.strip()]
+    if not lines:
+        log(f'[探测]{tag} stderr 为空')
+        return
+    for l in lines[:n]:
+        log(f'[探测]{tag} | {l[:120]}')
+    if len(lines) > n:
+        log(f'[探测]{tag} …(共{len(lines)}行)')
+
+
+def _probe_ffmpeg_fallback(path, log=None):
     """ffprobe 全部不可用时,解析 `ffmpeg -i` 的 stderr 拿基本信息。
     尝试所有候选,返回 (info, 使用的候选名);全部失败抛带明细的报错。"""
     attempts = []
     for name, ff in _ffmpeg_parse_candidates():
+        if log:
+            log(f'[探测]{name} 尝试 ffmpeg -i 解析: {ff}')
         try:
-            r = subprocess.run([ff, '-hide_banner', '-i', str(path)],
-                               capture_output=True, text=True, timeout=60,
-                               creationflags=CREATE_NO_WINDOW)
+            rc, out, err = _run_capture([ff, '-hide_banner', '-i', str(path)],
+                                        timeout=60, log=log, tag=f'[{name}]')
         except Exception as e:
             attempts.append(f'{name}:无法启动({type(e).__name__})')
             continue
-        err = r.stderr or ''
+        if log:
+            log(f'[探测][{name}] rc={rc} out={len(out)}B err={len(err)}B')
+            _log_head(log, f'[{name}]', err)
+        err = err or ''
         # 注意: Topaz ffmpeg 会打警告行 "...(Video: h264...)", 不能选它 —— 优先取 Stream 行
         vline = next((l for l in err.splitlines()
                       if l.strip().startswith('Stream') and 'Video:' in l), '')
@@ -507,31 +561,42 @@ def _probe_ffmpeg_fallback(path):
     raise RuntimeError('机器上没有任何 ffmpeg(引擎目录未定位到,PATH 里也没有)')
 
 
-def probe_video(path):
+def probe_video(path, log=None):
     """返回 dict: width,height,fps,frames,duration,has_audio,audio_codec,vcodec。
     探测链: 系统 ffprobe → Topaz ffprobe → ffmpeg -i 解析(Topaz/系统)。
-    全部失败时报出准确的已尝试清单与修复建议。"""
+    log 可传回调,逐级打印调试日志(命令/返回码/输出大小/stderr 原文)。"""
     info, tried = None, []
     for tag, ffprobe in _probe_candidates():
         tried.append(tag)
         try:
-            r = subprocess.run(
+            if log:
+                log(f'[探测]{tag} 尝试: {ffprobe}')
+            rc, out, err = _run_capture(
                 [ffprobe, '-v', 'error', '-show_streams', '-show_format',
                  '-of', 'json', str(path)],
-                capture_output=True, text=True, timeout=60,
-                creationflags=CREATE_NO_WINDOW)
-            if r.returncode != 0 or not r.stdout.strip():
-                tried[-1] += '(不可用/崩溃' + (
-                    f'({_ffmpeg_err_hint(r.stderr or "")[:80]})' if r.stderr else '') + ')'
+                timeout=60, log=log, tag=f'[{tag}]')
+            if log:
+                log(f'[探测][{tag}] rc={rc} stdout={len(out)}B stderr={len(err)}B')
+                if rc != 0 or not out.strip():
+                    _log_head(log, f'[{tag}]', err)
+            if rc != 0 or not (out or '').strip():
+                hint = _ffmpeg_err_hint(err or '')
+                tried[-1] += '(不可用/崩溃' + (f'({hint[:80]})' if hint else '') + ')'
                 continue
-            info = json.loads(r.stdout or '{}')
+            info = json.loads(out or '{}')
+            if log:
+                log(f'[探测]{tag} ✓ 解析成功')
             break
         except Exception as e:
             tried[-1] += f'(异常{type(e).__name__}: {str(e)[:120]})'
+            if log:
+                log(f'[探测]{tag} 异常: {type(e).__name__}: {str(e)[:160]}')
             continue
     if info is None:
         try:
-            info, _used = _probe_ffmpeg_fallback(path)
+            info, _used = _probe_ffmpeg_fallback(path, log=log)
+            if log:
+                log(f'[探测] ffmpeg -i 解析成功(候选: {_used})')
             return info            # -i 解析结果已是最终格式,直接返回
         except RuntimeError as e:
             msg = ('探测失败 —— 已依次尝试: ' + ('、'.join(tried) if tried else '(无 ffprobe 候选)')
@@ -569,13 +634,12 @@ def probe_video(path):
     if frames <= 0:
         for _tag, ffprobe in _probe_candidates():
             try:
-                r2 = subprocess.run(
+                rc2, out2, _e2 = _run_capture(
                     [ffprobe, '-v', 'error', '-count_packets', '-select_streams', 'v:0',
                      '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0', str(path)],
-                    capture_output=True, text=True, timeout=600,
-                    creationflags=CREATE_NO_WINDOW)
-                if r2.returncode == 0 and r2.stdout.strip():
-                    frames = int(r2.stdout.strip().split(',')[0])
+                    timeout=600, log=log, tag=f'[{_tag}/count]')
+                if rc2 == 0 and (out2 or '').strip():
+                    frames = int(out2.strip().split(',')[0])
                     break
             except Exception:
                 continue
@@ -1063,7 +1127,7 @@ def job_worker(job):
             trim_clip(job, src, t, trim_n)
             job.finish_step()
             work_in = t
-        job.info = probe_video(work_in)
+        job.info = probe_video(work_in, log=job.logf)
         info = job.info
         job.logf(f'[输入] {info["width"]}x{info["height"]} · {info["fps"]:g}fps · '
                  f'{info["frames"]} 帧 · {info["duration"]}s')
@@ -1705,15 +1769,25 @@ class App:
         path = self.vars['inpath'].get().strip()
         if not path or not os.path.isfile(path):
             self.info = None
-            self.info_lbl.config(text='✘ 文件不存在', foreground=ERR)
+            self.info_lbl.config(text=f'✘ 文件不存在: {path[:120]}' if path
+                                 else '✘ 请先填写视频路径', foreground=ERR)
             return
         self.info_lbl.config(text='探测中…', foreground=TX2)
         def work():
+            dbg = []
             try:
-                info = probe_video(path)
+                info = probe_video(path, log=dbg.append)
             except Exception as e:
                 info = {'error': str(e)}
             def done():
+                # 探测调试链路进控制台(成功也显示一行,失败显示全过程)
+                if dbg:
+                    self.log_txt.config(state='normal')
+                    for l in dbg:
+                        tag = 'err' if ('✘' in l or '失败' in l or '异常' in l) else 'tag'
+                        self.log_txt.insert('end', l + '\n', tag or ())
+                    self.log_txt.see('end')
+                    self.log_txt.config(state='disabled')
                 if 'error' in info:
                     self.info = None
                     self.info_lbl.config(text='✘ ' + info['error'], foreground=ERR)
