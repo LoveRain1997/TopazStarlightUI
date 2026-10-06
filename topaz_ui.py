@@ -424,7 +424,7 @@ def _ff():
 
 
 def _probe_candidates():
-    """ffprobe 候选: 系统 ffprobe(完整构建)优先, Topaz ffprobe 兜底。
+    """ffprobe 候选 (来源标签, 路径): 系统 ffprobe(完整构建)优先, Topaz ffprobe 兜底。
     Topaz ffprobe 是 --disable-decoder=h264/hevc 的定制构建,实测
     -show_streams 对 h264 会段错误,所以只做最后回退。"""
     cands = []
@@ -432,43 +432,74 @@ def _probe_candidates():
     if sysp:
         sysp = Path(sysp).resolve()
         if not (INSTALL and str(sysp).lower().startswith(str(INSTALL).lower())):
-            cands.append(str(sysp))
-    if INSTALL:
-        cands.append(str(INSTALL / 'ffprobe.exe'))
+            cands.append(('系统ffprobe(PATH)', str(sysp)))
+    if INSTALL and (INSTALL / 'ffprobe.exe').is_file():
+        cands.append(('Topaz ffprobe', str(INSTALL / 'ffprobe.exe')))
+    return cands
+
+
+def _ffmpeg_parse_candidates():
+    """可用于 `ffmpeg -i` 解析的候选 (来源标签, 路径): Topaz ffmpeg 优先, 系统兜底。"""
+    cands = []
+    if INSTALL and (INSTALL / 'ffmpeg.exe').is_file():
+        cands.append(('Topaz ffmpeg', str(INSTALL / 'ffmpeg.exe')))
+    sysf = shutil.which('ffmpeg')
+    if sysf:
+        sysf = str(Path(sysf).resolve())
+        if not (INSTALL and sysf.lower().startswith(str(INSTALL).lower())):
+            cands.append(('系统ffmpeg(PATH)', sysf))
     return cands
 
 
 def _probe_ffmpeg_fallback(path):
-    """无可用 ffprobe 时,解析 `ffmpeg -i` 的 stderr 拿基本信息。"""
-    ff, _ = _ff()
-    r = subprocess.run([ff, '-hide_banner', '-i', str(path)],
-                       capture_output=True, text=True, timeout=60,
-                       creationflags=CREATE_NO_WINDOW)
-    err = r.stderr or ''
-    vline = next((l for l in err.splitlines() if 'Video:' in l), '')
-    if not vline:
-        raise RuntimeError('无法解析视频信息(ffmpeg -i 无 Video 流)')
-    m = re.search(r'(\d{2,5})x(\d{2,5})', vline)
-    if not m:
-        raise RuntimeError('无法解析分辨率')
-    dur = 0.0
-    md = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', err)
-    if md:
-        dur = int(md.group(1)) * 3600 + int(md.group(2)) * 60 + float(md.group(3))
-    fps = 0.0
-    mf = re.search(r'([\d.]+)\s*fps', vline)
-    if mf:
-        fps = float(mf.group(1))
-    frames = int(round(dur * fps)) if fps > 0 and dur > 0 else 0
-    return {'width': int(m.group(1)), 'height': int(m.group(2)),
-            'fps': fps, 'frames': frames, 'duration': round(dur, 2),
-            'has_audio': 'Audio:' in err, 'audio_codec': '', 'vcodec': ''}
+    """ffprobe 全部不可用时,解析 `ffmpeg -i` 的 stderr 拿基本信息。
+    尝试所有候选,返回 (info, 使用的候选名);全部失败抛带明细的报错。"""
+    attempts = []
+    for name, ff in _ffmpeg_parse_candidates():
+        try:
+            r = subprocess.run([ff, '-hide_banner', '-i', str(path)],
+                               capture_output=True, text=True, timeout=60,
+                               creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            attempts.append(f'{name}:无法启动({type(e).__name__})')
+            continue
+        err = r.stderr or ''
+        # 注意: Topaz ffmpeg 会打警告行 "...(Video: h264...)", 不能选它 —— 优先取 Stream 行
+        vline = next((l for l in err.splitlines()
+                      if l.strip().startswith('Stream') and 'Video:' in l), '')
+        if not vline:
+            vline = next((l for l in err.splitlines() if 'Video:' in l), '')
+        m = re.search(r'(\d{2,5})x(\d{2,5})', vline) if vline else None
+        if not vline or not m:
+            attempts.append(f'{name}:输出无视频流信息')
+            continue
+        dur = 0.0
+        md = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', err)
+        if md:
+            dur = int(md.group(1)) * 3600 + int(md.group(2)) * 60 + float(md.group(3))
+        fps = 0.0
+        mf = re.search(r'([\d.]+)\s*fps', vline) or re.search(r'([\d.]+)\s*tbr', vline)
+        if mf:
+            fps = float(mf.group(1))
+        frames = int(round(dur * fps)) if fps > 0 and dur > 0 else 0
+        return ({'width': int(m.group(1)), 'height': int(m.group(2)),
+                 'fps': fps, 'frames': frames, 'duration': round(dur, 2),
+                 'has_audio': any(l.strip().startswith('Stream') and 'Audio:' in l
+                                  for l in err.splitlines()),
+                 'audio_codec': '', 'vcodec': ''},
+                name)
+    if attempts:
+        raise RuntimeError('全部候选失败 → ' + '; '.join(attempts))
+    raise RuntimeError('机器上没有任何 ffmpeg(引擎目录未定位到,PATH 里也没有)')
 
 
 def probe_video(path):
-    """返回 dict: width,height,fps,frames,duration,has_audio,audio_codec,vcodec。"""
-    info = None
-    for ffprobe in _probe_candidates():
+    """返回 dict: width,height,fps,frames,duration,has_audio,audio_codec,vcodec。
+    探测链: 系统 ffprobe → Topaz ffprobe → ffmpeg -i 解析(Topaz/系统)。
+    全部失败时报出准确的已尝试清单与修复建议。"""
+    info, tried = None, []
+    for tag, ffprobe in _probe_candidates():
+        tried.append(tag)
         try:
             r = subprocess.run(
                 [ffprobe, '-v', 'error', '-show_streams', '-show_format',
@@ -476,17 +507,23 @@ def probe_video(path):
                 capture_output=True, text=True, timeout=60,
                 creationflags=CREATE_NO_WINDOW)
             if r.returncode != 0 or not r.stdout.strip():
+                tried[-1] += '(不可用/崩溃)'
                 continue
             info = json.loads(r.stdout or '{}')
             break
-        except Exception:
+        except Exception as e:
+            tried[-1] += f'(异常{type(e).__name__})'
             continue
     if info is None:
         try:
-            return _probe_ffmpeg_fallback(path)
-        except Exception:
-            raise RuntimeError('探测失败: 本机没有可用的 ffprobe '
-                               '(Topaz ffprobe 对 h264 会崩溃,请确认系统装有 ffmpeg)')
+            info, _used = _probe_ffmpeg_fallback(path)
+            return info            # -i 解析结果已是最终格式,直接返回
+        except RuntimeError as e:
+            raise RuntimeError(
+                '探测失败 —— 已依次尝试: ' + ('、'.join(tried) if tried else '(无 ffprobe 候选)')
+                + '、ffmpeg -i 解析(' + str(e) + ')。'
+                '修复: ① 点「引擎设置…」确认 Topaz 安装目录正确; '
+                '② 或安装 ffmpeg 到 PATH(winget install ffmpeg)后重启本程序') from None
 
     vs = [s for s in info.get('streams', []) if s.get('codec_type') == 'video']
     as_ = [s for s in info.get('streams', []) if s.get('codec_type') == 'audio']
@@ -512,7 +549,7 @@ def probe_video(path):
     if frames <= 0 and fps_v > 0 and dur > 0:
         frames = int(round(dur * fps_v))
     if frames <= 0:
-        for ffprobe in _probe_candidates():
+        for _tag, ffprobe in _probe_candidates():
             try:
                 r2 = subprocess.run(
                     [ffprobe, '-v', 'error', '-count_packets', '-select_streams', 'v:0',
