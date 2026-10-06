@@ -1,0 +1,13 @@
+# 构建产物(可随时用 打包.bat 重建,不入库)
+Topaz星光UI.exe
+*.spec
+_build/
+dist/
+
+# 本地运行状态
+config.json
+*_error.log
+__pycache__/
+_test/
+_ui_*.png
+_ui_*.jpg
