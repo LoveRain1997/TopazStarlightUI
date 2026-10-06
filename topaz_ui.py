@@ -451,6 +451,19 @@ def _ffmpeg_parse_candidates():
     return cands
 
 
+_ERR_HINT_RE = re.compile(
+    r'Error|error|Invalid|No such|moov|Permission|not found|Corrupt|Unknown format|exists')
+
+
+def _ffmpeg_err_hint(err):
+    """从 ffmpeg/ffprobe stderr 里挑最有信息量的一行(错误关键词优先)。"""
+    lines = [l.strip() for l in err.splitlines() if l.strip()]
+    hint = next((l for l in lines if _ERR_HINT_RE.search(l)), '')
+    if not hint and lines:
+        hint = lines[-1]
+    return hint[:160]
+
+
 def _probe_ffmpeg_fallback(path):
     """ffprobe 全部不可用时,解析 `ffmpeg -i` 的 stderr 拿基本信息。
     尝试所有候选,返回 (info, 使用的候选名);全部失败抛带明细的报错。"""
@@ -471,7 +484,8 @@ def _probe_ffmpeg_fallback(path):
             vline = next((l for l in err.splitlines() if 'Video:' in l), '')
         m = re.search(r'(\d{2,5})x(\d{2,5})', vline) if vline else None
         if not vline or not m:
-            attempts.append(f'{name}:输出无视频流信息')
+            hint = _ffmpeg_err_hint(err)
+            attempts.append(f'{name}: 无视频流' + (f' —— {hint}' if hint else ''))
             continue
         dur = 0.0
         md = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', err)
@@ -507,23 +521,27 @@ def probe_video(path):
                 capture_output=True, text=True, timeout=60,
                 creationflags=CREATE_NO_WINDOW)
             if r.returncode != 0 or not r.stdout.strip():
-                tried[-1] += '(不可用/崩溃)'
+                tried[-1] += '(不可用/崩溃' + (
+                    f'({_ffmpeg_err_hint(r.stderr or "")[:80]})' if r.stderr else '') + ')'
                 continue
             info = json.loads(r.stdout or '{}')
             break
         except Exception as e:
-            tried[-1] += f'(异常{type(e).__name__})'
+            tried[-1] += f'(异常{type(e).__name__}: {str(e)[:120]})'
             continue
     if info is None:
         try:
             info, _used = _probe_ffmpeg_fallback(path)
             return info            # -i 解析结果已是最终格式,直接返回
         except RuntimeError as e:
-            raise RuntimeError(
-                '探测失败 —— 已依次尝试: ' + ('、'.join(tried) if tried else '(无 ffprobe 候选)')
-                + '、ffmpeg -i 解析(' + str(e) + ')。'
-                '修复: ① 点「引擎设置…」确认 Topaz 安装目录正确; '
-                '② 或安装 ffmpeg 到 PATH(winget install ffmpeg)后重启本程序') from None
+            msg = ('探测失败 —— 已依次尝试: ' + ('、'.join(tried) if tried else '(无 ffprobe 候选)')
+                   + '、ffmpeg -i 解析(' + str(e) + ')。'
+                   '修复: ① 点「引擎设置…」确认 Topaz 安装目录正确; '
+                   '② 或安装 ffmpeg 到 PATH(winget install ffmpeg)后重启本程序')
+            if re.search(r'Invalid data|moov|Corrupt|Unknown format', str(e)):
+                msg += ('。另: 该文件可能不是视频文件、尚未下载/生成完成(缺 mp4 头),'
+                        '或已损坏 —— 换个完整视频试试')
+            raise RuntimeError(msg) from None
 
     vs = [s for s in info.get('streams', []) if s.get('codec_type') == 'video']
     as_ = [s for s in info.get('streams', []) if s.get('codec_type') == 'audio']
