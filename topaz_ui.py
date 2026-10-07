@@ -1378,6 +1378,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.job = None            # 当前展示的任务
+        self._shutdown_pending = False
         self.shown_log_n = 0
         self.info = None           # 最近一次探测结果
         self._probe_after = None
@@ -1439,6 +1440,7 @@ class App:
         v['o_prefix'] = tk.StringVar(value='Topaz')
         v['o_date'] = tk.BooleanVar(value=True)
         v['o_audio'] = tk.BooleanVar(value=True)
+        v['shutdown'] = tk.BooleanVar(value=False)
         v['seg'] = tk.StringVar(value='0')
         v['tune'] = tk.StringVar(value=TUNE_PRESETS[0])
         v['tune_chunk'] = tk.StringVar(value='33')
@@ -1660,6 +1662,8 @@ class App:
                   (ttk.Checkbutton(lf4, text='日期子文件夹', variable=self.vars['o_date']), {}),
                   (ttk.Checkbutton(lf4, text='保留原音频', variable=self.vars['o_audio']),
                    {'padx': (20, 0)}),
+                  (ttk.Checkbutton(lf4, text='完成后自动关机(60秒,可取消)',
+                                   variable=self.vars['shutdown']), {'padx': (20, 0)}),
                   (ttk.Label(lf4, text='命名: 前缀_日期时间.mp4,不覆盖旧文件', style='Dim.TLabel'),
                    {'padx': (20, 0)}),
                   pady=2)
@@ -1673,6 +1677,8 @@ class App:
         self.btn_cancel = ttk.Button(act, text='取消任务', command=self._cancel,
                                      state='disabled')
         self.btn_cancel.pack(side='left', padx=8)
+        self.btn_noshut = ttk.Button(act, text='取消关机', command=self._abort_shutdown)
+        # 平时隐藏,仅关机倒计时期间显示
         self.status_lbl = ttk.Label(act, textvariable=self.vars['status'],
                                     foreground=TX2, font=(FONT, 9))
         self.status_lbl.pack(side='left', padx=12)
@@ -1730,6 +1736,8 @@ class App:
             self.vars['o_dir'].set(cfg['out']['dir'])
         if cfg.get('out', {}).get('prefix'):
             self.vars['o_prefix'].set(cfg['out']['prefix'])
+        if cfg.get('out', {}).get('shutdown') is not None:
+            self.vars['shutdown'].set(bool(cfg['out']['shutdown']))
         if cfg.get('mode'):
             self.vars['mode'].set(cfg['mode'])
             self._on_mode()
@@ -2012,7 +2020,8 @@ class App:
             'out': {'dir': self.vars['o_dir'].get().strip(),
                     'prefix': self.vars['o_prefix'].get().strip() or 'Topaz',
                     'date_sub': self.vars['o_date'].get(),
-                    'keep_audio': self.vars['o_audio'].get()},
+                    'keep_audio': self.vars['o_audio'].get(),
+                    'shutdown': self.vars['shutdown'].get()},
             'tune_ui': {'preset': preset,
                         'chunk': self.vars['tune_chunk'].get(),
                         'conv': self.vars['tune_conv'].get(),
@@ -2038,6 +2047,9 @@ class App:
         self.btn_run.config(state='disabled')
         self.btn_cancel.config(state='normal')
         self.vars['status'].set('启动中…')
+        if self._shutdown_pending:
+            self._abort_shutdown()          # 旧任务的关机倒计时作废
+        self.btn_noshut.pack_forget()
         _save_config({'last': params})
 
     def _cancel(self):
@@ -2168,6 +2180,51 @@ class App:
         if p and p != '—' and os.path.isfile(p):
             subprocess.Popen(['explorer', '/select,', os.path.normpath(p)])
 
+    # ---- 完成后自动关机 ----
+    def _console_line(self, text, tag='tag'):
+        """往日志控制台直接插一行(任务已结束、job.logf 不再被渲染时用)。"""
+        self.log_txt.config(state='normal')
+        self.log_txt.insert('end', text + '\n', tag or ())
+        self.log_txt.see('end')
+        self.log_txt.config(state='disabled')
+
+    def _maybe_shutdown(self, job):
+        """任务成功且勾选了自动关机 → 计划 60 秒倒计时(失败/取消不触发)。"""
+        if not self.vars['shutdown'].get():
+            return
+        try:
+            r = subprocess.run(['shutdown', '/s', '/t', '60',
+                                '/c', 'Topaz星光UI: 任务完成,60秒后关机'],
+                               capture_output=True, text=True, timeout=15,
+                               creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            r = None
+            job.logf(f'[关机] 计划失败: {type(e).__name__}: {e}')
+            self._console_line(f'[关机] 计划失败: {e}', 'err')
+        if r is not None and r.returncode == 0:
+            self._shutdown_pending = True
+            job.logf('[关机] 已计划 60 秒后自动关机 —— 点「取消关机」可中止')
+            self._console_line('[关机] 已计划 60 秒后自动关机 —— 点「取消关机」可中止')
+            self.btn_noshut.pack(side='left', padx=(0, 8))
+            self.vars['status'].set(f'✔ 完成 ({job.elapsed()}s) · 60秒后自动关机')
+            self.status_lbl.config(foreground=WARN)
+        elif r is not None:
+            job.logf('[关机] 计划失败: ' + (r.stderr or '').strip()[:120])
+            self._console_line('[关机] 计划失败: ' + (r.stderr or '').strip()[:120], 'err')
+
+    def _abort_shutdown(self):
+        """中止已计划的自动关机。"""
+        try:
+            subprocess.run(['shutdown', '/a'], capture_output=True, text=True,
+                           timeout=15, creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            pass
+        self._shutdown_pending = False
+        self.btn_noshut.pack_forget()
+        self._console_line('[关机] 已取消自动关机', 'ok')
+        self.vars['status'].set('已取消自动关机')
+        self.status_lbl.config(foreground=OK)
+
     def _on_close(self):
         if self.job and self.job.status == 'running':
             if not messagebox.askokcancel('退出', '任务正在运行,退出会取消任务。确定退出?',
@@ -2219,6 +2276,7 @@ class App:
                     self.step_lbl.config(text='全部步骤完成')
                     self.last_lbl.config(text=job.output)
                     self.bar['value'] = 100
+                    self._maybe_shutdown(job)
                 elif job.status == 'cancelled':
                     self.vars['status'].set('已取消')
                     self.status_lbl.config(foreground=WARN)
