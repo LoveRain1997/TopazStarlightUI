@@ -852,8 +852,12 @@ def run_upscale(job, in_path, out_path, p, pbase=0.0, pspan=100.0):
 def run_fi(job, in_path, out_path, p, frames_in=None, pbase=0.0, pspan=100.0):
     ff, _ = _ff()
     model = p['model']
-    fps_in, fps_out = float(p['fps_in']), float(p['fps_out'])
-    slowmo = float(p['slowmo'])
+    fps_in, fps_out = float(p['fps_in'] or 0), float(p['fps_out'] or 0)
+    slowmo = float(p['slowmo'] or 1.0)
+    if fps_in <= 0 or fps_out <= 0:
+        raise RuntimeError(
+            f'插帧帧率无效 (输入={fps_in}, 输出={fps_out}) —— 请检查「插帧参数」里的'
+            '两个帧率输入框不能为空或 0')
     if fps_out < fps_in:
         raise RuntimeError(f'输出帧率({fps_out})不能小于输入帧率({fps_in})')
     if fps_out == fps_in and slowmo <= 1.0:
@@ -872,6 +876,7 @@ def run_fi(job, in_path, out_path, p, frames_in=None, pbase=0.0, pspan=100.0):
           f'device={device}:vram={p["vram"]}:instances={p["instances"]}')
     if p.get('scene'):
         fi += ':parameters=scene_change_threshold=1'
+    job.logf(f'[插帧] 滤镜: {fi}')
 
     enc_args = (NS_ENC_GPU if p.get('enc', 'gpu') == 'gpu' else NS_ENC_CPU).split()
     cmd = [ff, '-y', '-stats_period', '5', '-loglevel', 'info', '-nostdin',
@@ -1995,6 +2000,19 @@ class App:
                       'dec_tile': dt, 'dec_overlap': max(8, dt // 8)}
         tune = tune_settings(preset, custom, gpu,
                              float(self.vars['u_vram'].get() or 96))
+        # fps 净化: 空/0/非法值自动回填(输入=探测值或24, 输出=输入×2.5取整), 不让 0 透传进引擎
+        try:
+            fps_in_v = float(self.vars['f_fps_in'].get() or 0)
+        except ValueError:
+            fps_in_v = 0.0
+        if fps_in_v <= 0:
+            fps_in_v = float(self.info['fps']) if (self.info and self.info.get('fps')) else 24.0
+        try:
+            fps_out_v = float(self.vars['f_fps_out'].get() or 0)
+        except ValueError:
+            fps_out_v = 0.0
+        if fps_out_v <= 0:
+            fps_out_v = max(60.0, fps_in_v * 2.5)
         return {
             'mode': self.vars['mode'].get(),
             'input': self.vars['inpath'].get().strip(),
@@ -2008,8 +2026,8 @@ class App:
                         'vram': float(self.vars['u_vram'].get() or 96),
                         'enc': enc, 'gpu': gpu, 'tune': tune},
             'fi': {'model': self.vars['f_model'].get(),
-                   'fps_in': float(self.vars['f_fps_in'].get() or 0),
-                   'fps_out': float(self.vars['f_fps_out'].get() or 0),
+                   'fps_in': round(fps_in_v, 3),
+                   'fps_out': round(fps_out_v, 3),
                    'slowmo': float(self.vars['f_slowmo'].get() or 1.0),
                    'instances': int(float(self.vars['f_inst'].get() or 2)),
                    'vram': float(self.vars['f_vram'].get() or 0.85),
@@ -2050,7 +2068,9 @@ class App:
         if self._shutdown_pending:
             self._abort_shutdown()          # 旧任务的关机倒计时作废
         self.btn_noshut.pack_forget()
-        _save_config({'last': params})
+        cfg = _load_config()
+        cfg['last'] = params
+        _save_config(cfg)          # 合并写入,不得覆盖 engine/tune_check/perf 等其他段
 
     def _cancel(self):
         if self.job and self.job.status == 'running':
