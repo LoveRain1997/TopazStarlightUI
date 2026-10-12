@@ -670,11 +670,16 @@ class Job:
         self.id = uuid.uuid4().hex[:8]
         self.params = params
         self.status = 'running'          # running / done / error / cancelled
-        self.steps = []                  # {name,status,pct,note}
+        self.steps = []                  # {name,status,pct,note,t0}
         self.log = deque(maxlen=3000)
         self.output = None
         self.error = None
         self.info = None
+        # 多文件队列
+        self.idx = 0                     # 当前第几个文件(0 基)
+        self.total = 1
+        self.current_file = ''
+        self.queue_done = []             # [(文件名, 'done'/'failed'/'cancelled')]
         self.t0 = time.time()
         self.t_end = None
         self.procs = []
@@ -728,11 +733,17 @@ class Job:
         return round((self.t_end or time.time()) - self.t0, 1)
 
     def overall(self):
-        """整体进度 0-100(按步骤数平均)。"""
-        if not self.steps:
-            return 0
-        tot = sum(s['pct'] if s['status'] == 'running' else 100 for s in self.steps)
-        return int(tot / len(self.steps))
+        """整体进度 0-100:多文件队列 = (已完成文件数 + 当前文件内步骤均值) / 总数。"""
+        inner = 0
+        if self.steps:
+            tot = sum(s['pct'] if s['status'] == 'running' else 100 for s in self.steps)
+            inner = tot / len(self.steps)
+        total = max(1, getattr(self, 'total', 1) or 1)
+        done = getattr(self, 'idx', 0)
+        frac = (done + inner / 100.0) / total
+        if self.status == 'done':
+            frac = 1.0
+        return int(min(100, frac * 100))
 
     def kill_tree(self):
         self.cancelled = True
@@ -1107,13 +1118,16 @@ def _save_perf(key, val):
 
 
 def job_worker(job):
+    """多文件队列:逐个文件跑完整管线;单文件失败记日志并继续下一个。"""
     tmp_files = []
-    try:
+
+    def 处理单个(src_str):
+        """处理一个文件。返回 'done' / 'failed' / 'cancelled'。"""
         p = job.params
         up, fi, out_cfg = p.get('upscale', {}), p.get('fi', {}), p.get('out', {})
         mode = p.get('mode', 'upscale')
 
-        src = Path(p['input'])
+        src = Path(src_str)
         out_dir = Path(out_cfg.get('dir') or src.parent)
         prefix = (out_cfg.get('prefix') or 'Topaz').strip() or 'Topaz'
         if out_cfg.get('date_sub'):
@@ -1181,7 +1195,7 @@ def job_worker(job):
         if n_seg > 1:
             job.step(f'分割 ({n_seg} 段 × ~{seg_sec:.0f}s)')
             seg_files, n_seg = split_video(job, work_in, out_dir, tag, seg_sec, info)
-            tmp_files += seg_files
+            tmp_files.extend(seg_files)
             job.finish_step(note=f'{n_seg} 段')
         else:
             seg_files = [work_in]
@@ -1266,18 +1280,48 @@ def job_worker(job):
         mux_audio(job, work_in, src, final, keep_audio=out_cfg.get('keep_audio', True))
         job.finish_step()
 
-        job.output = str(final)
-        job.status = 'done'
-        job.logf(f'✔ 完成: {final}')
-    except RuntimeError as e:
+        return str(final)
+
+    try:
+        p = job.params
+        inputs = list(p.get('inputs') or [p.get('input')])
+        job.total = max(1, len(inputs))
+        if job.total > 1:
+            job.logf(f'=== 队列共 {job.total} 个视频,逐个处理 ===')
+        失败清单 = []
+        for job.idx, one in enumerate(inputs):
+            if job.cancelled:
+                break
+            job.current_file = one
+            job.steps = []               # 队列进度条按文件整体计,单文件步骤每轮重置
+            job.logf(f'▶ [{job.idx + 1}/{job.total}] {Path(one).name}')
+            try:
+                final = 处理单个(one)
+                job.output = final
+                job.queue_done.append((Path(one).name, 'done'))
+                job.logf(f'✔ 完成: {final}')
+            except RuntimeError as e:
+                if job.cancelled:
+                    job.queue_done.append((Path(one).name, 'cancelled'))
+                    break
+                失败清单.append(f'{Path(one).name}: {e}')
+                job.queue_done.append((Path(one).name, 'failed'))
+                job.logf(f'✘ 失败: {e} —— 跳过,继续下一个')
+            except Exception as e:
+                失败清单.append(f'{Path(one).name}: {type(e).__name__}: {e}')
+                job.queue_done.append((Path(one).name, 'failed'))
+                job.logf(f'✘ 异常: {type(e).__name__}: {e} —— 跳过,继续下一个')
         if job.cancelled:
             job.status = 'cancelled'
-            job.logf('■ 已取消')
+            job.logf('■ 队列已取消')
+        elif 失败清单:
+            job.status = 'done'
+            job.error = '; '.join(失败清单)[:800]
+            成功 = sum(1 for _, s in job.queue_done if s == 'done')
+            job.logf(f'✔ 队列结束: 成功 {成功}/{job.total},失败 {len(失败清单)}(明细见上)')
         else:
-            job.status = 'error'
-            job.error = str(e)
-            job.logf(f'✘ 失败: {e}')
-            job.finish_step(ok=False, note=str(e)[:120])
+            job.status = 'done'
+            job.logf(f'✔ 队列全部完成: {job.total}/{job.total}')
     except Exception as e:
         job.status = 'error'
         job.error = f'{type(e).__name__}: {e}'
@@ -1309,8 +1353,14 @@ def _validate(params):
     mode = params.get('mode')
     if mode not in ('upscale', 'fi', 'chain'):
         return '无效的模式'
-    if not params.get('input') or not os.path.isfile(params['input']):
-        return '输入视频不存在'
+    inputs = list(params.get('inputs') or [])
+    if not inputs and params.get('input'):
+        inputs = [params['input']]
+    if not inputs:
+        return '请先添加视频文件'
+    缺 = [os.path.basename(x) for x in inputs if not os.path.isfile(x)]
+    if 缺:
+        return '以下视频文件不存在: ' + '、'.join(缺[:5]) + ('…' if len(缺) > 5 else '')
     up, fi = params.get('upscale', {}), params.get('fi', {})
     if mode in ('upscale', 'chain'):
         if up.get('model') not in [m for _, m in SLP_MODELS]:
@@ -1500,7 +1550,28 @@ class App:
                   (ttk.Entry(lf1, textvariable=self.vars['inpath'], width=46),
                    {'fill': 'x', 'expand': True, 'padx': (0, 6)}),
                   (ttk.Button(lf1, text='浏览…', width=8, command=self._browse), {}),
+                  (ttk.Button(lf1, text='添加多个…', width=11, command=self._browse_multi), {}),
                   pady=4)
+        # 队列:多选加入,按序逐个处理
+        qwrap = ttk.Frame(lf1)
+        qwrap.pack(fill='x', pady=(0, 4))
+        self.queue_list = tk.Listbox(qwrap, height=4, bg=BG2, fg=TX,
+                                     selectbackground='#cfe3f7',
+                                     selectforeground=TX, relief='flat',
+                                     highlightthickness=1,
+                                     highlightbackground=LINE, activestyle='none')
+        qs = ttk.Scrollbar(qwrap, command=self.queue_list.yview)
+        self.queue_list.configure(yscrollcommand=qs.set)
+        self.queue_list.pack(side='left', fill='both', expand=True)
+        qs.pack(side='right', fill='y')
+        qbtn = ttk.Frame(lf1)
+        qbtn.pack(fill='x', pady=(2, 0))
+        ttk.Button(qbtn, text='移除选中', width=10,
+                   command=self._queue_remove).pack(side='left')
+        ttk.Button(qbtn, text='清空队列', width=10,
+                   command=self._queue_clear).pack(side='left', padx=(6, 0))
+        ttk.Label(qbtn, text='队列里的视频会按顺序逐个处理(可用同一套参数)',
+                  style='Dim.TLabel').pack(side='left', padx=(10, 0))
         self.info_lbl = ttk.Label(lf1, text='改完路径自动探测分辨率/帧率/帧数/音轨', style='Dim.TLabel',
                                   wraplength=780, justify='left')
         self.info_lbl.pack(fill='x', pady=(0, 5))
@@ -1772,6 +1843,37 @@ class App:
             self.vars['inpath'].set(p)
             self._probe_async()
 
+    def _browse_multi(self):
+        files = filedialog.askopenfilenames(
+            title='选择多个视频(加入队列,按序处理)',
+            filetypes=[('视频文件', '*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.ts *.flv'),
+                       ('所有文件', '*.*')])
+        if files:
+            self._queue_add(files)
+
+    def _queue_add(self, files):
+        已有 = set(self.queue_list.get(0, 'end'))
+        加了 = 0
+        for f in files:
+            f = os.path.normpath(f)
+            if f not in 已有:
+                self.queue_list.insert('end', f)
+                已有.add(f)
+                加了 += 1
+        if 加了 and not self.vars['inpath'].get():
+            self.vars['inpath'].set(files[0])
+            self._probe_async()
+
+    def _queue_remove(self):
+        for i in reversed(self.queue_list.curselection()):
+            self.queue_list.delete(i)
+
+    def _queue_clear(self):
+        self.queue_list.delete(0, 'end')
+
+    def _queue_items(self):
+        return [x for x in self.queue_list.get(0, 'end') if os.path.isfile(x)]
+
     def _browse_dir(self):
         start = self.vars['o_dir'].get() or os.path.dirname(self.vars['inpath'].get()) or None
         p = filedialog.askdirectory(title='选择输出目录', initialdir=start)
@@ -2013,9 +2115,14 @@ class App:
             fps_out_v = 0.0
         if fps_out_v <= 0:
             fps_out_v = max(60.0, fps_in_v * 2.5)
+        inputs = self._queue_items()
+        单文件 = self.vars['inpath'].get().strip()
+        if not inputs and 单文件 and os.path.isfile(单文件):
+            inputs = [单文件]
         return {
             'mode': self.vars['mode'].get(),
-            'input': self.vars['inpath'].get().strip(),
+            'input': inputs[0] if inputs else 单文件,
+            'inputs': inputs,
             'trim_frames': int(float(self.vars['trim'].get() or 0)),
             'seg_seconds': 0 if self.vars['mode'].get() == 'fi'
                 else int(float(self.vars['seg'].get() or 0)),
@@ -2279,10 +2386,14 @@ class App:
                 self.shown_log_n = len(logs)
             cur = next((s for s in job.steps if s['status'] == 'running'), None)
             self.bar['value'] = job.overall()
+            队列前缀 = ''
+            if job.total > 1:
+                name = os.path.basename(job.current_file or '')
+                队列前缀 = f'[{job.idx + 1}/{job.total} {name[:28]}] '
             if cur:
                 seta = job.step_eta()
-                eta_txt = f' · 剩~{seta:.0f}s' if seta else ''
-                self.step_lbl.config(text=f'{cur["name"]} — {cur["pct"]}%{eta_txt}'
+                eta_txt = f' — {cur["pct"]}%' + (f' · 剩~{seta:.0f}s' if seta else '')
+                self.step_lbl.config(text=队列前缀 + cur['name'] + eta_txt
                                      + (f' · {cur["note"]}' if cur['note'] else ''))
                 oeta = job.overall_eta()
                 ot = f' · 预计剩 {oeta:.0f}s' if oeta else ''
@@ -2291,10 +2402,18 @@ class App:
                 self.btn_run.config(state='normal')
                 self.btn_cancel.config(state='disabled')
                 if job.status == 'done':
-                    self.vars['status'].set(f'✔ 完成 ({job.elapsed()}s)', )
-                    self.status_lbl.config(foreground=OK)
+                    成功 = sum(1 for _, s in job.queue_done if s == 'done')
+                    失败 = sum(1 for _, s in job.queue_done if s == 'failed')
+                    if job.total > 1:
+                        摘 = f'✔ 队列完成: 成功 {成功}/{job.total}'
+                        if 失败:
+                            摘 += f'(失败 {失败},明细见日志)'
+                        self.vars['status'].set(摘 + f' · {job.elapsed()}s')
+                    else:
+                        self.vars['status'].set(f'✔ 完成 ({job.elapsed()}s)')
+                    self.status_lbl.config(foreground=OK if not 失败 else WARN)
                     self.step_lbl.config(text='全部步骤完成')
-                    self.last_lbl.config(text=job.output)
+                    self.last_lbl.config(text=job.output or '—')
                     self.bar['value'] = 100
                     self._maybe_shutdown(job)
                 elif job.status == 'cancelled':
