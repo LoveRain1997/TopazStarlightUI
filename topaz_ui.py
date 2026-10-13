@@ -217,6 +217,9 @@ ASTRA_MODELS = ('astra', 'astrahq', 'astrasharp', 'astrafast')
 FI_MODELS = [('Aion 补帧 (AI视频推荐)', 'aion-1'), ('Apollo 插帧', 'apo-8'),
              ('Chronos (老版备选)', 'chr-2'), ('Apollo Fast', 'apf-2'),
              ('Chronos Fast', 'chf-3')]
+# 界面下拉显示的是名称,引擎要的是 id:选择后把名称翻译回 id(也兼容直接传 id)
+SLP_ID = {disp: mid for disp, mid in SLP_MODELS}
+FI_ID = {disp: mid for disp, mid in FI_MODELS}
 
 # ---- 引擎调优(思路源自 skv89/Topaz-SLP-Launcher:PYTHONPATH+sitecustomize
 #      在 neuroserver 进程内改 SLP 模块全局变量)。本机实测(RTX 5080 16G,144帧):
@@ -1369,6 +1372,8 @@ def _validate(params):
         if not (1.0 <= s <= 4.0):
             return '放大倍数需在 1.0 ~ 4.0'
     if mode in ('fi', 'chain'):
+        if fi.get('model') not in [m for _, m in FI_MODELS]:
+            return '无效的插帧模型'
         fps_in, fps_out = float(fi.get('fps_in') or 0), float(fi.get('fps_out') or 0)
         if fps_in <= 0 or fps_out <= 0:
             return '插帧需要输入/输出帧率'
@@ -1473,13 +1478,13 @@ class App:
         v = {}
         v['inpath'] = tk.StringVar()
         v['mode'] = tk.StringVar(value='upscale')
-        v['u_model'] = tk.StringVar(value='slp-26')
+        v['u_model'] = tk.StringVar(value='星光 2.6 (推荐)')
         v['u_scale'] = tk.StringVar(value='2.0')
         v['u_strength'] = tk.DoubleVar(value=1.0)
         v['u_strength_v'] = tk.StringVar(value='1.0')
         v['u_vram'] = tk.StringVar(value='96')
         v['u_fps'] = tk.StringVar(value='24')
-        v['f_model'] = tk.StringVar(value='aion-1')
+        v['f_model'] = tk.StringVar(value='Aion 补帧 (AI视频推荐)')
         v['f_fps_in'] = tk.StringVar(value='24')
         v['f_fps_out'] = tk.StringVar(value='60')
         v['f_slowmo'] = tk.StringVar(value='1.0')
@@ -2126,13 +2131,15 @@ class App:
             'trim_frames': int(float(self.vars['trim'].get() or 0)),
             'seg_seconds': 0 if self.vars['mode'].get() == 'fi'
                 else int(float(self.vars['seg'].get() or 0)),
-            'upscale': {'model': self.vars['u_model'].get(),
+            'upscale': {'model': SLP_ID.get(self.vars['u_model'].get(),
+                                            self.vars['u_model'].get()),
                         'scale': float(self.vars['u_scale'].get() or 2.0),
                         'fps': int(float(self.vars['u_fps'].get() or 24)),
                         'strength': round(float(self.vars['u_strength'].get()), 1),
                         'vram': float(self.vars['u_vram'].get() or 96),
                         'enc': enc, 'gpu': gpu, 'tune': tune},
-            'fi': {'model': self.vars['f_model'].get(),
+            'fi': {'model': FI_ID.get(self.vars['f_model'].get(),
+                                      self.vars['f_model'].get()),
                    'fps_in': round(fps_in_v, 3),
                    'fps_out': round(fps_out_v, 3),
                    'slowmo': float(self.vars['f_slowmo'].get() or 1.0),
