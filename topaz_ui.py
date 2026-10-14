@@ -1467,7 +1467,7 @@ class App:
         self._build()
         self._load_last()
         self._poll()
-        root.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     # ---- 样式:Windows 原生 vista 主题(系统控件/焦点/悬停/DPI 渲染全走系统) ----
     def _style(self):
@@ -1618,6 +1618,13 @@ class App:
                        (ttk.Label(self.p_up, textvariable=self.vars['outsize'],
                                   foreground=GOLD), {'padx': (8, 0)}),
                        pady=4)
+        # 模型选择提示:含 8G 及以下显存的推荐配置(当前引擎无 Mini,7.0+ 才有)
+        self.model_hint = ttk.Label(self.p_up, style='Dim.TLabel', wraplength=760,
+                                    justify='left',
+                                    text=("模型提示: 星光 2.6 画质最佳(16G 显存推荐) · Astra 家族需 ≥9 帧 · "
+                                          "8G 及以下显存推荐「星光 2.6 + 显存上限填 8 + 调优选保守省显存」"
+                                          "(等效轻量档,约慢一倍) · 星光 Mini 需 Topaz 7.0+ 引擎(当前 1.7.1 未启用)"))
+        self.model_hint.pack(fill='x', pady=(0, 2))
         um.pack(fill='x')
         qrow = self._row(self.p_up, pady=1)
         ttk.Label(qrow, text='目标:', style='Dim.TLabel').pack(side='left')
@@ -1786,7 +1793,14 @@ class App:
         # ── 日志 ──
         lf5 = ttk.Labelframe(main, text=' 引擎日志 ')
         lf5.pack(fill='both', expand=True, pady=4)
-        self.log_txt = tk.Text(lf5, height=11, width=70, bg=LOG_BG, fg=LOG_FG, bd=0,
+        # 日志行数按屏幕逻辑高度自适应:小屏压缩日志,优先保证参数区完整可见
+        try:
+            缩放 = max(1.0, self.root.winfo_fpixels('1i') / 96.0)
+            屏逻辑高 = self.root.winfo_screenheight() / 缩放
+        except Exception:
+            屏逻辑高 = 1080
+        日志行 = 6 if 屏逻辑高 >= 1400 else (5 if 屏逻辑高 >= 1200 else 3)
+        self.log_txt = tk.Text(lf5, height=日志行, width=70, bg=LOG_BG, fg=LOG_FG, bd=0,
                                font=('Consolas', 9), state='disabled',
                                insertbackground=TX, wrap='none')
         ys = ttk.Scrollbar(lf5, command=self.log_txt.yview)
@@ -1812,11 +1826,19 @@ class App:
         self.gpu_cb.bind('<<ComboboxSelected>>',
                          lambda *_: (self._upd_seg(), self._upd_tune()))
         self._upd_tune()
-        # 按内容实际尺寸开窗,夹在屏幕范围内(任何 DPI 下不裁切、不超屏)
+        # 窗口尺寸:优先恢复用户上次的尺寸(拖大过就不用每次再拖),并夹在屏幕内
         self.root.update_idletasks()
         rw, rh = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
-        gw = min(rw + 16, self.root.winfo_screenwidth() - 16)
-        gh = min(rh + 16, self.root.winfo_screenheight() - 60)
+        屏宽, 屏高 = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        gw = min(rw + 16, 屏宽 - 16)
+        gh = min(rh + 16, 屏高 - 60)
+        记忆 = _load_config().get('win') or []
+        try:
+            if len(记忆) == 2 and int(记忆[0]) >= self.root.minsize()[0] \
+                    and int(记忆[1]) >= self.root.minsize()[1]:
+                gw, gh = min(int(记忆[0]), 屏宽 - 16), min(int(记忆[1]), 屏高 - 60)
+        except Exception:
+            pass
         self.root.geometry(f'{int(gw)}x{int(gh)}+60+40')
 
     # ---- 配置记忆 ----
@@ -2513,9 +2535,10 @@ class App:
                 return
             self.job.kill_tree()
         try:
-            # 退出时把当前全部 UI 参数落盘(下次打开原样恢复)
+            # 退出时把当前全部 UI 参数与窗口尺寸落盘(下次打开原样恢复)
             cfg = _load_config()
             cfg['last'] = self._collect()
+            cfg['win'] = [self.root.winfo_width(), self.root.winfo_height()]
             _save_config(cfg)
         except Exception:
             pass
