@@ -220,6 +220,8 @@ FI_MODELS = [('Aion 补帧 (AI视频推荐)', 'aion-1'), ('Apollo 插帧', 'apo-
 # 界面下拉显示的是名称,引擎要的是 id:选择后把名称翻译回 id(也兼容直接传 id)
 SLP_ID = {disp: mid for disp, mid in SLP_MODELS}
 FI_ID = {disp: mid for disp, mid in FI_MODELS}
+SLP_DISP = {mid: disp for disp, mid in SLP_MODELS}
+FI_DISP = {mid: disp for disp, mid in FI_MODELS}
 
 # ---- 引擎调优(思路源自 skv89/Topaz-SLP-Launcher:PYTHONPATH+sitecustomize
 #      在 neuroserver 进程内改 SLP 模块全局变量)。本机实测(RTX 5080 16G,144帧):
@@ -678,11 +680,16 @@ class Job:
         self.output = None
         self.error = None
         self.info = None
-        # 多文件队列
-        self.idx = 0                     # 当前第几个文件(0 基)
-        self.total = 1
+        # 多文件队列(动态:运行中可继续追加,worker 加锁消费)
+        _init_inputs = list(params.get('inputs') or [])
+        if not _init_inputs and params.get('input'):
+            _init_inputs = [params['input']]
+        self.pending = _init_inputs
+        self.pending_lock = threading.Lock()
+        self.idx = 0                     # 已取出的文件数(0 基计数)
+        self.total = max(1, len(self.pending))
         self.current_file = ''
-        self.queue_done = []             # [(文件名, 'done'/'failed'/'cancelled')]
+        self.queue_done = []             # [(全路径, 'done'/'failed'/'cancelled')]
         self.t0 = time.time()
         self.t_end = None
         self.procs = []
@@ -1287,32 +1294,37 @@ def job_worker(job):
 
     try:
         p = job.params
-        inputs = list(p.get('inputs') or [p.get('input')])
-        job.total = max(1, len(inputs))
+        job.total = max(1, len(job.pending))
         if job.total > 1:
             job.logf(f'=== 队列共 {job.total} 个视频,逐个处理 ===')
         失败清单 = []
-        for job.idx, one in enumerate(inputs):
+        while True:
             if job.cancelled:
                 break
+            with job.pending_lock:
+                if not job.pending:
+                    break
+                one = job.pending.pop(0)
+            job.idx += 1
+            job.total = job.idx + 1 + len(job.pending)   # 动态总数(运行中可追加)
             job.current_file = one
             job.steps = []               # 队列进度条按文件整体计,单文件步骤每轮重置
-            job.logf(f'▶ [{job.idx + 1}/{job.total}] {Path(one).name}')
+            job.logf(f'▶ [{job.idx}/{job.total}] {Path(one).name}')
             try:
                 final = 处理单个(one)
                 job.output = final
-                job.queue_done.append((Path(one).name, 'done'))
+                job.queue_done.append((one, 'done'))
                 job.logf(f'✔ 完成: {final}')
             except RuntimeError as e:
                 if job.cancelled:
-                    job.queue_done.append((Path(one).name, 'cancelled'))
+                    job.queue_done.append((one, 'cancelled'))
                     break
                 失败清单.append(f'{Path(one).name}: {e}')
-                job.queue_done.append((Path(one).name, 'failed'))
+                job.queue_done.append((one, 'failed'))
                 job.logf(f'✘ 失败: {e} —— 跳过,继续下一个')
             except Exception as e:
                 失败清单.append(f'{Path(one).name}: {type(e).__name__}: {e}')
-                job.queue_done.append((Path(one).name, 'failed'))
+                job.queue_done.append((one, 'failed'))
                 job.logf(f'✘ 异常: {type(e).__name__}: {e} —— 跳过,继续下一个')
         if job.cancelled:
             job.status = 'cancelled'
@@ -1321,10 +1333,11 @@ def job_worker(job):
             job.status = 'done'
             job.error = '; '.join(失败清单)[:800]
             成功 = sum(1 for _, s in job.queue_done if s == 'done')
-            job.logf(f'✔ 队列结束: 成功 {成功}/{job.total},失败 {len(失败清单)}(明细见上)')
+            job.logf(f'✔ 队列结束: 成功 {成功}/{len(job.queue_done)},'
+                     f'失败 {len(失败清单)}(明细见上)')
         else:
             job.status = 'done'
-            job.logf(f'✔ 队列全部完成: {job.total}/{job.total}')
+            job.logf(f'✔ 队列全部完成: {len(job.queue_done)}/{len(job.queue_done)}')
     except Exception as e:
         job.status = 'error'
         job.error = f'{type(e).__name__}: {e}'
@@ -1557,7 +1570,8 @@ class App:
                   (ttk.Button(lf1, text='浏览…', width=8, command=self._browse), {}),
                   (ttk.Button(lf1, text='添加多个…', width=11, command=self._browse_multi), {}),
                   pady=4)
-        # 队列:多选加入,按序逐个处理
+        # 队列:多选加入,按序逐个处理;行带状态标记,未执行的可删/可排序
+        self._rows: list[dict] = []      # [{'path': str, 'status': pending/running/done/failed/cancelled}]
         qwrap = ttk.Frame(lf1)
         qwrap.pack(fill='x', pady=(0, 4))
         self.queue_list = tk.Listbox(qwrap, height=4, bg=BG2, fg=TX,
@@ -1571,12 +1585,12 @@ class App:
         qs.pack(side='right', fill='y')
         qbtn = ttk.Frame(lf1)
         qbtn.pack(fill='x', pady=(2, 0))
-        ttk.Button(qbtn, text='移除选中', width=10,
-                   command=self._queue_remove).pack(side='left')
-        ttk.Button(qbtn, text='清空队列', width=10,
-                   command=self._queue_clear).pack(side='left', padx=(6, 0))
-        ttk.Label(qbtn, text='队列里的视频会按顺序逐个处理(可用同一套参数)',
-                  style='Dim.TLabel').pack(side='left', padx=(10, 0))
+        for 文本, 命令 in (('移除', self._queue_remove), ('上移', lambda: self._queue_move(-1)),
+                          ('下移', lambda: self._queue_move(1)),
+                          ('清已完成', self._queue_clear_done),
+                          ('清空', self._queue_clear)):
+            ttk.Button(qbtn, text=文本, width=8, command=命令).pack(side='left', padx=(0, 4))
+        ttk.Label(qbtn, text='按序逐个处理;运行中也能继续添加', style='Dim.TLabel').pack(side='left', padx=(6, 0))
         self.info_lbl = ttk.Label(lf1, text='改完路径自动探测分辨率/帧率/帧数/音轨', style='Dim.TLabel',
                                   wraplength=780, justify='left')
         self.info_lbl.pack(fill='x', pady=(0, 5))
@@ -1807,29 +1821,92 @@ class App:
 
     # ---- 配置记忆 ----
     def _load_last(self):
+        """全量恢复上次会话的全部参数(勾选/下拉/数值/队列),失败逐项忽略。"""
         cfg = _load_config().get('last', {})
         if not cfg:
             return
         if cfg.get('input'):
             self.vars['inpath'].set(cfg['input'])
             self._probe_async()
-        if cfg.get('out', {}).get('dir'):
-            self.vars['o_dir'].set(cfg['out']['dir'])
-        if cfg.get('out', {}).get('prefix'):
-            self.vars['o_prefix'].set(cfg['out']['prefix'])
-        if cfg.get('out', {}).get('shutdown') is not None:
-            self.vars['shutdown'].set(bool(cfg['out']['shutdown']))
+
+        # 队列列表(存的是待处理文件)
+        for f in (cfg.get('inputs') or []):
+            if os.path.isfile(f):
+                self._rows.append({'path': os.path.normpath(f), 'status': 'pending'})
+        self._render_queue()
+
+        # ① 模式
         if cfg.get('mode'):
             self.vars['mode'].set(cfg['mode'])
             self._on_mode()
-        if cfg.get('upscale'):
-            u = cfg['upscale']
+
+        # ② 超分参数(模型存的是 id,回填显示名;兼容已是显示名的旧配置)
+        u = cfg.get('upscale') or {}
+        if u:
+            if u.get('model'):
+                self.vars['u_model'].set(SLP_DISP.get(u['model'], u['model'])
+                                         if u['model'] in SLP_DISP else u['model'])
             if u.get('scale'):
                 self.vars['u_scale'].set(str(u['scale']))
             if u.get('fps'):
                 self.vars['u_fps'].set(str(u['fps']))
+            if u.get('strength'):
+                self.vars['u_strength'].set(float(u['strength']))
+                self.vars['u_strength_v'].set(f"{float(u['strength']):.1f}")
+            if u.get('vram'):
+                self.vars['u_vram'].set(str(u['vram']))
+            if u.get('enc'):
+                # 配置里存的是 'gpu'/'cpu',映射回下拉显示名
+                v = u['enc']
+                self.vars['enc'].set(
+                    'GPU (h264_nvenc 快)' if v == 'gpu'
+                    else 'CPU (h264_mf 兼容)' if v == 'cpu' else v)
+            if u.get('gpu') not in (None, ''):
+                g = u['gpu']
+                if g == 'auto':
+                    self.gpu_cb.current(0)
+                else:
+                    for i, gg in enumerate(GPUS):
+                        if gg['driver_idx'] == int(g):
+                            self.gpu_cb.current(i)
+                            break
+
+        # ③ 插帧参数
+        fi = cfg.get('fi') or {}
+        if fi:
+            if fi.get('model'):
+                self.vars['f_model'].set(FI_DISP.get(fi['model'], fi['model'])
+                                         if fi['model'] in FI_DISP else fi['model'])
+            for key, var in (('fps_in', 'f_fps_in'), ('fps_out', 'f_fps_out'),
+                             ('slowmo', 'f_slowmo'), ('instances', 'f_inst'),
+                             ('vram', 'f_vram'), ('rdt_sens', 'f_sens')):
+                if fi.get(key) is not None:
+                    self.vars[var].set(str(fi[key]))
+            if fi.get('rdt_on') is not None:
+                self.vars['f_rdt'].set(bool(fi['rdt_on']))
+            if fi.get('scene') is not None:
+                self.vars['f_scene'].set(bool(fi['scene']))
+
+        # ④ 其他
+        if cfg.get('trim_frames') is not None:
+            self.vars['trim'].set(str(cfg.get('trim_frames') or 0))
         if cfg.get('seg_seconds') is not None:
             self.vars['seg'].set(str(cfg.get('seg_seconds') or 0))
+
+        # ⑤ 输出
+        out = cfg.get('out') or {}
+        if out.get('dir'):
+            self.vars['o_dir'].set(out['dir'])
+        if out.get('prefix'):
+            self.vars['o_prefix'].set(out['prefix'])
+        if out.get('date_sub') is not None:
+            self.vars['o_date'].set(bool(out['date_sub']))
+        if out.get('keep_audio') is not None:
+            self.vars['o_audio'].set(bool(out['keep_audio']))
+        if out.get('shutdown') is not None:
+            self.vars['shutdown'].set(bool(out['shutdown']))
+
+        # ⑥ 调优预设
         tu = cfg.get('tune_ui')
         if tu:
             if tu.get('preset') in TUNE_PRESETS:
@@ -1857,27 +1934,85 @@ class App:
             self._queue_add(files)
 
     def _queue_add(self, files):
-        已有 = set(self.queue_list.get(0, 'end'))
-        加了 = 0
+        """加入队列;已有任务在跑时,新文件直接追加进运行中任务的待处理列表。"""
+        已有 = {r['path'] for r in self._rows}
+        运行中 = bool(self.job and self.job.status == 'running')
         for f in files:
             f = os.path.normpath(f)
-            if f not in 已有:
-                self.queue_list.insert('end', f)
-                已有.add(f)
-                加了 += 1
-        if 加了 and not self.vars['inpath'].get():
-            self.vars['inpath'].set(files[0])
-            self._probe_async()
+            if f in 已有:
+                continue
+            self._rows.append({'path': f, 'status': 'pending'})
+            已有.add(f)
+            if 运行中:
+                with self.job.pending_lock:
+                    self.job.pending.append(f)
+                self._console_line(f'[队列] 已追加: {os.path.basename(f)}(当前文件结束后自动开始)')
+        self._render_queue()
+        if 加了 := sum(1 for r in self._rows if r['status'] == 'pending'):
+            if not self.vars['inpath'].get() and files:
+                self.vars['inpath'].set(files[0])
+                self._probe_async()
+
+    _QICON = {'pending': '', 'running': '▶ ', 'done': '✔ ',
+              'failed': '✘ ', 'cancelled': '■ '}
+
+    def _render_queue(self):
+        选中 = set(self.queue_list.curselection())
+        self.queue_list.delete(0, 'end')
+        for i, r in enumerate(self._rows):
+            self.queue_list.insert('end', f"{self._QICON.get(r['status'], '')}{r['path']}")
+            if r['status'] == 'done':
+                self.queue_list.itemconfig('end', foreground='#6b6b6b')
+            elif r['status'] == 'failed':
+                self.queue_list.itemconfig('end', foreground='#c42b1c')
+            elif r['status'] == 'running':
+                self.queue_list.itemconfig('end', foreground='#005fb8')
+        for i in 选中:
+            if i < len(self._rows):
+                self.queue_list.selection_set(i)
 
     def _queue_remove(self):
-        for i in reversed(self.queue_list.curselection()):
-            self.queue_list.delete(i)
+        for i in sorted(self.queue_list.curselection(), reverse=True):
+            if i < len(self._rows) and self._rows[i]['status'] == 'pending':
+                del self._rows[i]
+        self._render_queue()
+
+    def _queue_move(self, 方向):
+        选中 = sorted(self.queue_list.curselection())
+        if len(选中) != 1:
+            return
+        i = 选中[0]
+        j = i + 方向
+        if not (0 <= j < len(self._rows)):
+            return
+        if self._rows[i]['status'] != 'pending' or self._rows[j]['status'] != 'pending':
+            # 运行中任务的"待处理"区间内允许换位;已开始/已完成的不可动
+            if not (self.job and self.job.status == 'running' and
+                    self._rows[i]['status'] == 'pending' and self._rows[j]['status'] == 'pending'):
+                return
+        self._rows[i], self._rows[j] = self._rows[j], self._rows[i]
+        self._render_queue()
+        self.queue_list.selection_set(j)
+        # 运行中:把重排同步进任务的真实待处理列表(pending 状态行 ↔ job.pending 同序)
+        if self.job and self.job.status == 'running':
+            with self.job.pending_lock:
+                self.job.pending = [r['path'] for r in self._rows if r['status'] == 'pending']
+
+    def _queue_clear_done(self):
+        # 只清已出结果的行;正在跑和待处理的保留
+        self._rows = [r for r in self._rows
+                      if r['status'] in ('pending', 'running')]
+        self._render_queue()
 
     def _queue_clear(self):
-        self.queue_list.delete(0, 'end')
+        if any(r['status'] == 'running' for r in self._rows):
+            return
+        self._rows = []
+        self._render_queue()
 
     def _queue_items(self):
-        return [x for x in self.queue_list.get(0, 'end') if os.path.isfile(x)]
+        return [r['path'] for r in self._rows
+                if r['status'] == 'pending' and os.path.isfile(r['path'])]
 
     def _browse_dir(self):
         start = self.vars['o_dir'].get() or os.path.dirname(self.vars['inpath'].get()) or None
@@ -2163,6 +2298,18 @@ class App:
 
     def _run(self):
         params = self._collect()
+        # 队列没有待处理项但有已完成/失败项时,询问是否全部重置重跑
+        if not self._queue_items() and any(
+                r['status'] in ('done', 'failed', 'cancelled') for r in self._rows):
+            if messagebox.askokcancel('重新处理',
+                                      '队列里没有待处理的文件。\n把已完成的和失败的都重置为待处理并重新处理?',
+                                      parent=self.root):
+                for r in self._rows:
+                    r['status'] = 'pending'
+                self._render_queue()
+                params = self._collect()
+            else:
+                return
         err = _validate(params)
         if err:
             messagebox.showwarning('参数有误', err, parent=self.root)
@@ -2365,6 +2512,13 @@ class App:
                                           parent=self.root):
                 return
             self.job.kill_tree()
+        try:
+            # 退出时把当前全部 UI 参数落盘(下次打开原样恢复)
+            cfg = _load_config()
+            cfg['last'] = self._collect()
+            _save_config(cfg)
+        except Exception:
+            pass
         self.root.destroy()
 
     # ---- 轮询刷新 ----
@@ -2393,6 +2547,15 @@ class App:
                 self.shown_log_n = len(logs)
             cur = next((s for s in job.steps if s['status'] == 'running'), None)
             self.bar['value'] = job.overall()
+            # 同步队列行状态:已完成的打 ✔/✘,当前文件标 ▶
+            if job.queue_done or job.current_file:
+                done_map = {pth: s for pth, s in job.queue_done}
+                for r in self._rows:
+                    if r['path'] in done_map:
+                        r['status'] = done_map[r['path']]
+                    elif r['path'] == job.current_file and r['status'] == 'pending':
+                        r['status'] = 'running'
+                self._render_queue()
             队列前缀 = ''
             if job.total > 1:
                 name = os.path.basename(job.current_file or '')
