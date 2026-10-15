@@ -1,5 +1,6 @@
 # 构建产物(可随时用 打包.bat 重建,不入库)
 Topaz星光UI.exe
+Topaz星光CLI.exe
 *.spec
 _build/
 dist/
