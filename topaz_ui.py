@@ -1093,14 +1093,14 @@ def concat_segments(job, files, out_path):
 
 # ---- 任务编排 ---------------------------------------------------------------
 
-def unique_path(directory, prefix):
+def unique_path(directory, stem):
+    """目标名已存在时追加 _2、_3……绝不覆盖。"""
     d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    p = d / f'{prefix}_{stamp}.mp4'
+    p = d / f'{stem}.mp4'
     n = 2
     while p.exists():
-        p = d / f'{prefix}_{stamp}_{n}.mp4'
+        p = d / f'{stem}_{n}.mp4'
         n += 1
     return p
 
@@ -1139,10 +1139,21 @@ def job_worker(job):
 
         src = Path(src_str)
         out_dir = Path(out_cfg.get('dir') or src.parent)
-        prefix = (out_cfg.get('prefix') or 'Topaz').strip() or 'Topaz'
+        prefix = (out_cfg.get('prefix') or '').strip()
         if out_cfg.get('date_sub'):
             out_dir = out_dir / datetime.now().strftime('%Y-%m-%d')
-        final = unique_path(out_dir, prefix)
+        # 输出命名: 源文件名_处理标注.mp4(在原名后追加,不整体重命名)
+        # 标注默认按模式自动生成;用户在「文件名标注」里填了自定义文字则用它
+        if prefix and prefix != 'Topaz':
+            标注 = prefix
+        else:
+            标注 = []
+            if mode in ('upscale', 'chain'):
+                标注.append(f'星光{float(up.get("scale") or 2.0):g}x')
+            if mode in ('fi', 'chain'):
+                标注.append(f'插帧{float(fi.get("fps_out") or 60):g}fps')
+            标注 = '_'.join(标注) or '处理'
+        final = unique_path(out_dir, f'{src.stem}_{标注}')
         out_dir.mkdir(parents=True, exist_ok=True)
         tag = uuid.uuid4().hex[:8]
 
@@ -1510,7 +1521,7 @@ class App:
         v['enc'] = tk.StringVar(value='GPU (h264_nvenc 快)')
         v['trim'] = tk.StringVar(value='0')
         v['o_dir'] = tk.StringVar()
-        v['o_prefix'] = tk.StringVar(value='Topaz')
+        v['o_prefix'] = tk.StringVar(value='')
         v['o_date'] = tk.BooleanVar(value=True)
         v['o_audio'] = tk.BooleanVar(value=True)
         v['shutdown'] = tk.BooleanVar(value=False)
@@ -1757,7 +1768,7 @@ class App:
                   (ttk.Entry(lf4, textvariable=self.vars['o_dir'], width=40),
                    {'fill': 'x', 'expand': True, 'padx': (0, 6)}),
                   (ttk.Button(lf4, text='…', width=4, command=self._browse_dir), {}),
-                  (ttk.Label(lf4, text='前缀'), {'padx': (16, 6)}),
+                  (ttk.Label(lf4, text='文件名标注'), {'padx': (16, 6)}),
                   (ttk.Entry(lf4, textvariable=self.vars['o_prefix'], width=12), {}),
                   pady=4)
         self._row(lf4,
@@ -1766,7 +1777,8 @@ class App:
                    {'padx': (20, 0)}),
                   (ttk.Checkbutton(lf4, text='完成后自动关机(60秒,可取消)',
                                    variable=self.vars['shutdown']), {'padx': (20, 0)}),
-                  (ttk.Label(lf4, text='命名: 前缀_日期时间.mp4,不覆盖旧文件', style='Dim.TLabel'),
+                  (ttk.Label(lf4, text='输出=原名_标注.mp4(如 歌名_星光2x_插帧60fps);标注留空自动按模式生成,不覆盖旧文件',
+                             style='Dim.TLabel'),
                    {'padx': (20, 0)}),
                   pady=2)
 
@@ -1920,7 +1932,8 @@ class App:
         if out.get('dir'):
             self.vars['o_dir'].set(out['dir'])
         if out.get('prefix'):
-            self.vars['o_prefix'].set(out['prefix'])
+            # 旧版默认 'Topaz' 视同为空(自动按模式生成标注)
+            self.vars['o_prefix'].set('' if out['prefix'] == 'Topaz' else out['prefix'])
         if out.get('date_sub') is not None:
             self.vars['o_date'].set(bool(out['date_sub']))
         if out.get('keep_audio') is not None:
@@ -2307,7 +2320,7 @@ class App:
                    'scene': self.vars['f_scene'].get(),
                    'enc': enc, 'gpu': gpu},
             'out': {'dir': self.vars['o_dir'].get().strip(),
-                    'prefix': self.vars['o_prefix'].get().strip() or 'Topaz',
+                    'prefix': self.vars['o_prefix'].get().strip(),
                     'date_sub': self.vars['o_date'].get(),
                     'keep_audio': self.vars['o_audio'].get(),
                     'shutdown': self.vars['shutdown'].get()},
