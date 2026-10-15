@@ -210,7 +210,9 @@ NS_ENC_GPU = ('-c:v h264_nvenc -profile:v high -pix_fmt yuv420p -g 30 '
 NS_ENC_CPU = ('-c:v h264_mf -rate_control quality -quality 65 '
               '-pix_fmt yuv420p -g 30 -bf 0')
 
-SLP_MODELS = [('星光 2.6 (推荐)', 'slp-26'), ('Astra', 'astra'),
+SLP_MODELS = [('星光 2.6 (推荐)', 'slp-26'),
+              ('星光 Mini (低显存/快速)', 'slm'),
+              ('Astra', 'astra'),
               ('Astra HQ', 'astrahq'), ('Astra Sharp', 'astrasharp'),
               ('Astra Fast (需Intel核显)', 'astrafast')]
 ASTRA_MODELS = ('astra', 'astrahq', 'astrasharp', 'astrafast')
@@ -1629,12 +1631,13 @@ class App:
                        (ttk.Label(self.p_up, textvariable=self.vars['outsize'],
                                   foreground=GOLD), {'padx': (8, 0)}),
                        pady=4)
-        # 模型选择提示:含 8G 及以下显存的推荐配置(当前引擎无 Mini,7.0+ 才有)
+        # 模型选择提示:含 8G 及以下显存的推荐配置
         self.model_hint = ttk.Label(self.p_up, style='Dim.TLabel', wraplength=760,
                                     justify='left',
-                                    text=("模型提示: 星光 2.6 画质最佳(16G 显存推荐) · Astra 家族需 ≥9 帧 · "
-                                          "8G 及以下显存推荐「星光 2.6 + 显存上限填 8 + 调优选保守省显存」"
-                                          "(等效轻量档,约慢一倍) · 星光 Mini 需 Topaz 7.0+(1.7.1 路由表未收录)"))
+                                    text=("模型提示: 星光 2.6 画质最佳 · 星光 Mini 轻量快速,8G 显存友好"
+                                          "(首次用前需先在 Topaz GUI 里选 Mini 跑一次以下载权重) · "
+                                          "Astra 家族需 ≥9 帧 · 8G 及以下显存建议把「显存上限」填 8,"
+                                          "并调优选「保守省显存」"))
         self.model_hint.pack(fill='x', pady=(0, 2))
         um.pack(fill='x')
         qrow = self._row(self.p_up, pady=1)
