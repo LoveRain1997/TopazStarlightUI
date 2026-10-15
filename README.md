@@ -1,7 +1,8 @@
-# Rev.5.13 Topaz 星光独立UI — 使用说明
+# Rev.5.14 Topaz 星光独立UI — 使用说明
 
 | 版本记录 | |
 |---|---|
+| Rev.5.14 \| 2026-10-15 \| 新增 CLI 模式(供 AI/脚本直接调用):新增 **Topaz星光CLI.exe**(控制台版)——`Topaz星光CLI.exe 视频1 视频2 …` 默认超分x2+插帧60fps,输出在输入同目录、不建日期文件夹;支持目录展开、--mode/--scale/--fps-out/--model/--fi-model/--tune/--seg/--trim/--out/--shutdown/--json(结果 JSON 便于解析)、--check 引擎检测;修复:相对路径输入(引擎子进程 cwd 不同找不到 trim 产物)、chain 模式 fps_in 自动探测被校验拦截、queue_done 携带输出路径与失败原因 | |
 | Rev.5.13 \| 2026-10-15 \| 推翻 Rev.5.10/5.12 对星光 Mini 的错误结论(经用户指正):minAppVersion 的 7.0.0 就是 GUI 1.7.0 的内部版本号,Mini 属于当前版本线;"Model not found" 的真实原因是**权重未下载**(C/E 两个模型库均无 slm 权重文件,neuroserver/models/slm 里只有加载器代码)。已把「星光 Mini (低显存/快速)」加入超分模型下拉——首次使用前先在 Topaz GUI 里选 Mini 跑一次以下载权重,之后本 UI 直接可用 | |
 | Rev.5.12 \| 2026-10-15 \| 模型可用性调研更正:minAppVersion 版本线澄清,真门槛=neuroserver 路由表(穷举仅 slp-25/slp-26/hyp-2),确认星光未找错(SLP/SLM 两条产品线) | |
 | Rev.5.11 \| 2026-10-15 \| ①输出命名改为「源文件名_标注.mp4」:默认按模式自动标注(如 我的歌曲_星光2x_插帧60fps.mp4),重名自动加 _2 绝不覆盖;「文件名前缀」字段更名「文件名标注」,留空=自动,填了自定义文字则替代自动标注(旧默认值 Topaz 视同为空)。②修复配置污染:此前持久化测试把试跑帧数/编码/插帧模型等写进了用户配置(表现为"默认变试跑15"),已重置,且测试改为隔离配置不再污染 | |
@@ -44,6 +45,26 @@ Topaz Video(1.7.1)引擎,在桌面窗口里完成:
 - 引擎:`E:\Program Files\Topaz Labs LLC\Topaz Video`(自动检测:注册表 + 常见路径)
 - 模型库:`E:\ProgramData\Topaz Labs LLC\Topaz Video\models\models`(slp26 权重 7.4GB,已确认在位)
 - 调用方式与 ComfyUI-TopazStarlight 节点包**完全一致**(neuroserver.exe --once / ffmpeg tvai_fi),参数默认值同源
+
+## 二、启动
+
+### CLI 命令行(AI / 脚本推荐,Topaz星光CLI.exe)
+
+```
+Topaz星光CLI.exe 视频1.mp4 视频2.mp4           # 默认: 超分x2 + 插帧60fps,输出在视频同目录
+Topaz星光CLI.exe 某个目录                      # 目录自动收集其中全部视频
+Topaz星光CLI.exe a.mp4 --mode upscale          # 仅超分
+Topaz星光CLI.exe a.mp4 --scale 1.5 --fps-out 48 --model slm
+Topaz星光CLI.exe --check                       # 引擎环境检测(JSON 风格文本)
+Topaz星光CLI.exe a.mp4 --json                  # 结果以 JSON 输出(便于 AI/程序解析)
+```
+
+- 常用选项:`--mode chain|upscale|fi`、`--scale 2.0`、`--fps-out 60`、`--model slp-26|slm|astra…`、
+  `--fi-model aion-1|apo-8|…`、`--strength`、`--vram`、`--gpu auto|0|1`、`--tune auto|native|conservative`、
+  `--seg 秒`、`--trim 帧`、`--enc gpu|cpu`、`--out 目录`、`--shutdown`、`--json`
+- 输出固定在**输入文件同目录**(不建日期子文件夹),命名 `原名_星光2x_插帧60fps.mp4`,重名自动 _2
+- 多文件/队列逐个处理,单个失败自动继续;`--json` 时过程静默、只输出最终 JSON
+- 退出码:0=全部成功,3=有失败,2=参数/输入错误
 
 ## 二、启动
 

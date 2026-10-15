@@ -1139,8 +1139,10 @@ def job_worker(job):
         up, fi, out_cfg = p.get('upscale', {}), p.get('fi', {}), p.get('out', {})
         mode = p.get('mode', 'upscale')
 
-        src = Path(src_str)
+        src = Path(src_str).resolve()          # CLI 可能传相对路径,引擎子进程 cwd 不同,必须绝对
         out_dir = Path(out_cfg.get('dir') or src.parent)
+        if out_cfg.get('dir'):
+            out_dir = out_dir.resolve()
         prefix = (out_cfg.get('prefix') or '').strip()
         if out_cfg.get('date_sub'):
             out_dir = out_dir / datetime.now().strftime('%Y-%m-%d')
@@ -1326,26 +1328,27 @@ def job_worker(job):
             try:
                 final = 处理单个(one)
                 job.output = final
-                job.queue_done.append((one, 'done'))
+                job.queue_done.append((one, 'done', str(final)))
                 job.logf(f'✔ 完成: {final}')
             except RuntimeError as e:
                 if job.cancelled:
-                    job.queue_done.append((one, 'cancelled'))
+                    job.queue_done.append((one, 'cancelled', ''))
                     break
                 失败清单.append(f'{Path(one).name}: {e}')
-                job.queue_done.append((one, 'failed'))
+                job.queue_done.append((one, 'failed', str(e)[:300]))
                 job.logf(f'✘ 失败: {e} —— 跳过,继续下一个')
             except Exception as e:
-                失败清单.append(f'{Path(one).name}: {type(e).__name__}: {e}')
-                job.queue_done.append((one, 'failed'))
-                job.logf(f'✘ 异常: {type(e).__name__}: {e} —— 跳过,继续下一个')
+                原因 = f'{type(e).__name__}: {e}'
+                失败清单.append(f'{Path(one).name}: {原因}')
+                job.queue_done.append((one, 'failed', 原因[:300]))
+                job.logf(f'✘ 异常: {原因} —— 跳过,继续下一个')
         if job.cancelled:
             job.status = 'cancelled'
             job.logf('■ 队列已取消')
         elif 失败清单:
             job.status = 'done'
             job.error = '; '.join(失败清单)[:800]
-            成功 = sum(1 for _, s in job.queue_done if s == 'done')
+            成功 = sum(1 for _, s, *_ in job.queue_done if s == 'done')
             job.logf(f'✔ 队列结束: 成功 {成功}/{len(job.queue_done)},'
                      f'失败 {len(失败清单)}(明细见上)')
         else:
@@ -1401,8 +1404,11 @@ def _validate(params):
         if fi.get('model') not in [m for _, m in FI_MODELS]:
             return '无效的插帧模型'
         fps_in, fps_out = float(fi.get('fps_in') or 0), float(fi.get('fps_out') or 0)
-        if fps_in <= 0 or fps_out <= 0:
-            return '插帧需要输入/输出帧率'
+        # chain 模式 fps_in=0 合法(worker 自动按源帧率填充);纯插帧必须显式给出
+        if mode == 'fi' and fps_in <= 0:
+            return '插帧需要输入帧率'
+        if fps_out <= 0:
+            return '插帧需要输出帧率'
         if fps_out < fps_in:
             return '输出帧率不能小于输入帧率'
         if fps_out == fps_in and float(fi.get('slowmo') or 1) <= 1.0:
@@ -2588,7 +2594,7 @@ class App:
             self.bar['value'] = job.overall()
             # 同步队列行状态:已完成的打 ✔/✘,当前文件标 ▶
             if job.queue_done or job.current_file:
-                done_map = {pth: s for pth, s in job.queue_done}
+                done_map = {pth: s for pth, s, *_ in job.queue_done}
                 for r in self._rows:
                     if r['path'] in done_map:
                         r['status'] = done_map[r['path']]
@@ -2611,8 +2617,8 @@ class App:
                 self.btn_run.config(state='normal')
                 self.btn_cancel.config(state='disabled')
                 if job.status == 'done':
-                    成功 = sum(1 for _, s in job.queue_done if s == 'done')
-                    失败 = sum(1 for _, s in job.queue_done if s == 'failed')
+                    成功 = sum(1 for _, s, *_ in job.queue_done if s == 'done')
+                    失败 = sum(1 for _, s, *_ in job.queue_done if s == 'failed')
                     if job.total > 1:
                         摘 = f'✔ 队列完成: 成功 {成功}/{job.total}'
                         if 失败:
@@ -2642,8 +2648,164 @@ class App:
 # main
 # ===========================================================================
 
+# ===========================================================================
+# CLI 模式:AI / 命令行直接调用
+#   Topaz星光CLI.exe 文件1 [文件2 ...] [选项]
+#   python topaz_ui.py 文件1 ... [选项]
+# 默认 chain(超分+插帧);输出=各输入文件所在目录(不建日期子文件夹)
+# ===========================================================================
+
+CLI_视频后缀 = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.ts', '.flv'}
+
+
+def cli_main(argv):
+    import argparse
+    p = argparse.ArgumentParser(
+        prog='Topaz星光CLI',
+        description='Topaz 星光命令行:视频超分(星光) + 插帧(Aion/Apollo),'
+                    '直接调用本机 Topaz Video 引擎。默认 超分+插帧,输出到输入文件同目录。',
+        epilog='示例:\n'
+               '  Topaz星光CLI a.mp4 b.mp4            超分x2+插帧60fps\n'
+               '  Topaz星光CLI 目录 --mode upscale    仅超分一个目录里的全部视频\n'
+               '  Topaz星光CLI a.mp4 --scale 1.5 --fps-out 48 --model slm',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('inputs', nargs='*',
+                   help='输入视频,可多个;传目录则自动收集其中的视频文件')
+    p.add_argument('--mode', choices=['chain', 'upscale', 'fi'], default='chain',
+                   help='chain=超分+插帧(默认) | upscale=仅超分 | fi=仅插帧')
+    p.add_argument('--scale', type=float, default=2.0, help='超分倍数 1.0~4.0(默认 2.0)')
+    p.add_argument('--fps-out', type=float, default=60, help='插帧输出帧率(默认 60)')
+    p.add_argument('--fps-in', type=float, default=0,
+                   help='插帧输入帧率(默认 0=自动探测;chain 模式总是自动)')
+    p.add_argument('--model', default='slp-26',
+                   help='超分模型 id: slp-26(星光2.6)/slm(星光Mini)/astra/astrahq/astrasharp/astrafast')
+    p.add_argument('--fi-model', default='aion-1',
+                   help='插帧模型 id: aion-1(推荐)/apo-8/chr-2/apf-2/chf-3')
+    p.add_argument('--strength', type=float, default=1.0,
+                   help='增强强度 0.5~1.5(默认 1.0)')
+    p.add_argument('--vram', type=float, default=96, help='显存上限 GiB(默认 96=不设限;8G 卡建议 8)')
+    p.add_argument('--gpu', default='auto', help='auto(默认)或 GPU 驱动号 0/1/…')
+    p.add_argument('--tune', choices=['auto', 'native', 'conservative'], default='auto',
+                   help='引擎调优预设(默认 auto=按显存自动)')
+    p.add_argument('--seg', type=float, default=0,
+                   help='分段秒数,0=按显存自动(默认);仅超分生效')
+    p.add_argument('--trim', type=int, default=0, help='试跑帧数(0=全部,默认)')
+    p.add_argument('--enc', choices=['gpu', 'cpu'], default='gpu', help='输出编码(默认 gpu)')
+    p.add_argument('--out', default='', help='输出目录(默认=各输入文件所在目录)')
+    p.add_argument('--shutdown', action='store_true', help='全部完成后 60 秒自动关机')
+    p.add_argument('--check', action='store_true', help='仅检测引擎环境(文本输出)')
+    p.add_argument('--json', action='store_true', help='结果以 JSON 输出(便于程序/AI 解析)')
+    a = p.parse_args(argv)
+
+    def 输出json(obj):
+        print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+    def 报错(文本, code=2):
+        if a.json:
+            输出json({'ok': False, 'error': 文本})
+        else:
+            print('错误: ' + 文本, file=sys.stderr)
+        return code
+
+    if a.check:
+        st = engine_status()
+        结果 = {**st, 'ok': st['ok']}
+        if a.json:
+            输出json(结果)
+        else:
+            print(json.dumps(st, ensure_ascii=False, indent=2))
+        return 0 if st['ok'] else 1
+
+    st = engine_status()
+    if not st['ok']:
+        return 报错('引擎不完整: ' + '; '.join(st['errors']))
+
+    # 收集输入(文件或目录)
+    files = []
+    for x in a.inputs:
+        if os.path.isdir(x):
+            files += sorted(str(f) for f in Path(x).iterdir()
+                            if f.is_file() and f.suffix.lower() in CLI_视频后缀)
+        elif os.path.isfile(x):
+            files.append(os.path.normpath(x))
+        else:
+            return 报错(f'输入不存在: {x}')
+    if not files:
+        p.print_help()
+        return 2
+
+    tune = tune_settings({'auto': TUNE_PRESETS[0], 'native': TUNE_PRESETS[1],
+                          'conservative': TUNE_PRESETS[2]}[a.tune],
+                         None, a.gpu if a.gpu == 'auto' else int(a.gpu), a.vram)
+    params = {
+        'mode': a.mode,
+        'input': files[0],
+        'inputs': files,
+        'trim_frames': a.trim,
+        'seg_seconds': 0 if a.mode == 'fi' else a.seg,
+        'upscale': {'model': a.model, 'scale': a.scale,
+                    'fps': int(round(a.fps_in or 24)), 'strength': a.strength,
+                    'vram': a.vram, 'enc': a.enc, 'gpu': a.gpu, 'tune': tune},
+        'fi': {'model': a.fi_model, 'fps_in': a.fps_in or 0, 'fps_out': a.fps_out,
+               'slowmo': 1.0, 'instances': 2, 'vram': 0.85,
+               'rdt_on': True, 'rdt_sens': 5, 'scene': False,
+               'enc': a.enc, 'gpu': a.gpu},
+        'out': {'dir': a.out, 'prefix': '', 'date_sub': False,
+                'keep_audio': True, 'shutdown': a.shutdown},
+    }
+    err = _validate(params)
+    if err:
+        return 报错(err)
+
+    job = Job(params)
+    threading.Thread(target=job_worker, args=(job,), daemon=True).start()
+
+    已打印 = 0
+    while job.status == 'running':
+        logs = list(job.log)
+        if not a.json:               # --json 模式静默,只输出最终 JSON
+            for line in logs[已打印:]:
+                print(line)
+        已打印 = len(logs)
+        time.sleep(0.4)
+    if not a.json:
+        for line in list(job.log)[已打印:]:
+            print(line)
+
+    结果 = [{'input': pth,
+             'output': (e or '') if s == 'done' else '',
+             'status': s, 'error': (e or '')[:300] if s != 'done' else ''}
+            for pth, s, e in job.queue_done]
+    if a.shutdown and job.status == 'done' and not job.cancelled:
+        subprocess.run(['shutdown', '/s', '/t', '60', '/c', 'Topaz星光CLI: 全部完成'],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW)
+        print('已计划 60 秒后自动关机(shutdown /a 可取消)')
+
+    if a.json:
+        输出json({'ok': job.status == 'done' and not any(
+                      s == 'failed' for _, s, *_ in job.queue_done),
+                  'elapsed': job.elapsed(),
+                  'results': 结果})
+    else:
+        print('=== 汇总 ===')
+        for r in 结果:
+            print(('OUTPUT: ' + r['output']) if r['output'] else
+                  (f'FAILED: {r["input"]}' + (f' — {r["error"]}' if r['error'] else '')))
+        print(f'用时 {job.elapsed()}s')
+    return 0 if job.status == 'done' and not any(s == 'failed' for _, s, *_ in job.queue_done) else 3
+
+
 def main():
-    if '--check' in sys.argv:
+    argv = sys.argv[1:]
+    # 控制台版 CLI exe(文件名含 CLI):永远走命令行模式(无参数=帮助)
+    if getattr(sys, 'frozen', False) and 'cli' in Path(sys.executable).stem.lower():
+        return cli_main(argv)
+    # 源码/GUI exe 带参数(文件/目录/选项)时也走命令行;无参数=GUI
+    if argv and (argv[0] == '--cli' or os.path.exists(argv[0])
+                 or argv[0].startswith('-')):
+        return cli_main(argv)
+
+    if '--check' in argv:
         st = engine_status()
         lines = [f'引擎: {"OK" if st["ok"] else "不完整"}']
         lines += ['安装目录: ' + str(st['install'] or '未找到'),
