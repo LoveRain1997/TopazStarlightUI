@@ -1634,7 +1634,7 @@ class App:
                                     justify='left',
                                     text=("模型提示: 星光 2.6 画质最佳(16G 显存推荐) · Astra 家族需 ≥9 帧 · "
                                           "8G 及以下显存推荐「星光 2.6 + 显存上限填 8 + 调优选保守省显存」"
-                                          "(等效轻量档,约慢一倍) · 星光 Mini 需 Topaz 7.0+ 引擎(当前 1.7.1 未启用)"))
+                                          "(等效轻量档,约慢一倍) · 星光 Mini 需 Topaz 7.0+(1.7.1 路由表未收录)"))
         self.model_hint.pack(fill='x', pady=(0, 2))
         um.pack(fill='x')
         qrow = self._row(self.p_up, pady=1)
